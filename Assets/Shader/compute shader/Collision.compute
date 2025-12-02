@@ -1,0 +1,438 @@
+struct Tri
+{
+    float3 vertex0;
+    float3 vertex1;
+    float3 vertex2;
+};
+
+struct Line {
+    float3 p0;
+    float3 p1;
+    float3 direction;
+    float3 origin;
+};
+
+struct Triangle
+{
+    int v0;
+    int v1;
+    int v2;
+};
+
+struct collisionResult{
+    bool isCollide;
+    float3 hitPoint;
+};
+
+#define Epsilon 0.00001
+
+uint triCount;
+uint nodeCount;
+uint totalNodeCount;
+float convergence_factor;
+
+float3 hitPoint;
+
+RWStructuredBuffer<float3> positions;
+RWStructuredBuffer<float3> ProjectedPositions;
+RWStructuredBuffer<float3> velocities;
+RWStructuredBuffer<int3> directions;
+RWStructuredBuffer<int> directionCount;
+RWStructuredBuffer<Triangle> triangles;
+
+void AtomicAddDirections(int index, float direction, int axis) {
+    uint i_val = asuint(direction);
+    uint tmp0 = 0;
+    uint tmp1;
+
+    [allow_uav_condition]
+    while (true) {
+        InterlockedCompareExchange(directions[index][axis], tmp0, i_val, tmp1);
+
+        if (tmp1 == tmp0) {
+            break;
+        }
+
+        tmp0 = tmp1;
+        i_val = asuint(direction + asfloat(tmp1));
+    }
+
+    return;
+}
+
+///////////// Tri-Intersection function ////////////
+float3 ProjectPointOnPlane(float3 p, float3 planeNormal, float3 planePoint)
+{
+    float d = dot(planeNormal, (p - planePoint)) / length(planeNormal) ;
+    return p - d * planeNormal;
+}
+
+bool IsPointInsideTriangle(float3 p, Tri tri)
+{
+    float3 normal = normalize(cross(tri.vertex1 - tri.vertex0, tri.vertex2 - tri.vertex0));
+
+    // ���� �ﰢ�� ��鿡 ����
+    float3 projectedPoint = ProjectPointOnPlane(p, normal, tri.vertex0);
+
+    //if (distance(projectedPoint, p) > 0.1) return false;
+    if (distance(projectedPoint, p) > 0.01) return false;
+
+    // ������ ���� ���� ���� �Ǵ� ����
+    float3 edge1 = tri.vertex1 - tri.vertex0;
+    float3 vp1 = projectedPoint - tri.vertex0;
+    if (dot(cross(edge1, vp1), normal) < 0) return false;
+
+    float3 edge2 = tri.vertex2 - tri.vertex1;
+    float3 vp2 = projectedPoint - tri.vertex1;
+    if (dot(cross(edge2, vp2), normal) < 0) return false;
+
+    float3 edge3 = tri.vertex0 - tri.vertex2;
+    float3 vp3 = projectedPoint - tri.vertex2;
+    if (dot(cross(edge3, vp3), normal) < 0) return false;
+
+    return true; // ��� �˻縦 ����ߴٸ�, ������ ���� �ﰢ�� ���ο� �ֽ��ϴ�.
+}
+
+collisionResult Intersect(Tri tri, Line ray)
+{
+    collisionResult cr;
+    cr.isCollide = false;
+    cr.hitPoint = float3(0.0, 0.0, 0.0);
+
+    // Vectors from p1 to p2/p3 (edges)
+    //Find vectors for edges sharing vertex/point p1
+    float3 e1 = tri.vertex1 - tri.vertex0;
+    float3 e2 = tri.vertex2 - tri.vertex0;
+
+    ray.direction = normalize(ray.p1 - ray.p0);
+    float3 p = cross(ray.direction, e2);
+
+    //Calculate determinat
+    float det = dot(e1, p);
+
+    //if determinant is near zero, ray lies in plane of triangle otherwise not
+    //if (det > -Mathf.Epsilon && det < Mathf.Epsilon)
+    if (det > -Epsilon && det < Epsilon)
+    {
+        bool coplanar = IsPointInsideTriangle(ray.p0, tri);
+        bool coplanar2 = IsPointInsideTriangle(ray.p1, tri);
+
+        cr.hitPoint = float3(0.0, 0.0, 0.0);
+        if (coplanar) cr.hitPoint = ray.p0;
+        if (coplanar2) cr.hitPoint = ray.p1;
+
+        cr.isCollide = coplanar || coplanar2;
+
+        return cr;
+    }
+    float invDet = 1.0f / det;
+
+    //calculate distance from p1 to ray origin
+    ray.origin = ray.p0;
+    float3 t = ray.origin - tri.vertex0;
+
+    //Calculate u parameter
+    float u = dot(t, p) * invDet;
+
+    //Check for ray hit
+    if (u < 0 || u > 1) { cr.isCollide = false;
+    cr.hitPoint = float3(0.0, 0.0, 0.0);
+    return cr; }
+
+    //Prepare to test v parameter
+    float3 q = cross(t, e1);
+
+    //Calculate v parameter
+    float v = dot(ray.direction, q) * invDet;
+
+    //Check for ray hit
+    if (v < 0 || u + v > 1) { cr.isCollide = false;
+    cr.hitPoint = float3(0.0, 0.0, 0.0);
+    return cr; }
+
+    // intersection point
+    cr.hitPoint = tri.vertex0 + u * e1 + v * e2;
+
+    if ((dot(e2, q) * invDet) > Epsilon)
+    {
+        cr.isCollide = true;
+        //ray does intersect            
+        return cr;
+    }
+
+    // No hit at all
+    cr.isCollide = false;
+    cr.hitPoint = float3(0.0, 0.0, 0.0);
+    return cr;
+}
+
+collisionResult CheckEdgeCollision(float3 vertex1, float3 vertex2, Tri t)
+{
+    //var edge = new Line();
+    // Instantiate a Line struct
+    Line edge;
+
+    edge.p0 = vertex1;
+    edge.p1 = vertex2;
+
+    return Intersect(t, edge);
+}
+
+int3 calculateSpace(float3 position) {
+    return int3((position.x + 50.0) / 0.5, (position.y + 50.0) / 0.5, (position.z + 50.0) / 0.5);
+}
+
+bool compareVec3(int3 a, int3 b) {
+    return all(a == b);
+}
+
+bool areTriangleSameVoxel(Tri t1, Tri t2) {
+    int3 cloth_space1 = calculateSpace(t1.vertex0);
+    int3 cloth_space2 = calculateSpace(t1.vertex1);
+    int3 cloth_space3 = calculateSpace(t1.vertex2);
+
+    int3 object_space1 = calculateSpace(t2.vertex0);
+    int3 object_space2 = calculateSpace(t2.vertex1);
+    int3 object_space3 = calculateSpace(t2.vertex2);
+
+    if(compareVec3(cloth_space1, object_space1) || compareVec3(cloth_space1, object_space2) || compareVec3(cloth_space1, object_space3)) {
+        return true;
+    }
+    if(compareVec3(cloth_space2, object_space1) || compareVec3(cloth_space2, object_space2) || compareVec3(cloth_space2, object_space3)) {
+        return true;
+    }
+    if(compareVec3(cloth_space3, object_space1) || compareVec3(cloth_space3, object_space2) || compareVec3(cloth_space3, object_space3)) {
+        return true;
+    }
+    return false;
+}
+
+
+float3 caclulateNormal(float3 v0, float3 v1, float3 v2){
+    // 삼각형의 두 변을 나타내는 벡터 계산
+    float3 edge1 = v1 - v0;
+    float3 edge2 = v2 - v0;
+
+    // 두 벡터의 외적을 계산하여 삼각형의 면에 수직인 벡터(면의 normal)을 구함
+    float3 normal = cross(edge1, edge2);
+
+    // normal 벡터를 정규화하여 단위 벡터로 만듦
+    normal = normalize(normal);
+
+    return normal;
+}
+
+float3 Reflect(float3 V, float3 N)
+{
+    return V - 2 * dot(V, N) * N;
+}
+
+float CalculateDirectionAdjustment(float3 collisionPoint, float3 objectPosition, float3 normal) {
+    float3 directionToObject = objectPosition - collisionPoint;
+    // 내적을 사용하여 두 벡터 사이의 각도를 계산합니다.
+    float dotProduct = dot(normalize(directionToObject), normalize(normal));
+    // 내적이 0보다 작으면 두 벡터가 반대 방향임을 의미하므로 음수 조정을 반환합니다.
+    return dotProduct < 0.0 ? -1.0 : 1.0;
+}
+
+
+float3 TrianglePointResponse(float3 vel, float3 normal, float3 relVel, float tolerance, float timeStep) {
+    
+    float3 normalComponent = normal * dot(normal, relVel); // 정규 성분 계산
+
+    float3 tangentialComponent = vel - normalComponent; // 접선 성분 계산
+    float3 response = tangentialComponent - normalComponent; // 반응 계산 (사용되지 않음)
+
+    // 비탄성 충돌 적용
+    float vn = length(normalComponent); // 정규 성분의 크기
+    normalComponent = normalize(normalComponent); // 정규 성분 정규화
+
+    float distance = length(normal); // 거리 계산 (원본 코드에서의 용도와 다를 수 있음)
+    float geoMag = vn * (1.0 / 2.0); // 기하학적 반발력 = m*Vn/2
+    float springMag1 = timeStep * 1.0; // 첫 번째 스프링 반발력 크기
+    float springMag2 = 1.0 * ((tolerance - distance) / timeStep - vn); // 두 번째 스프링 반발력 크기
+
+    // 최소 크기 선택
+    if (springMag1 < springMag2) {
+        normalComponent *= -(geoMag / timeStep + springMag1);
+    } else {
+        normalComponent *= -(geoMag / timeStep + springMag2);
+    }
+
+    return normalComponent;
+}
+
+#pragma kernel CollisionNodeTriangle
+[numthreads(32, 32, 1)]
+void CollisionNodeTriangle (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint j = id.y;
+
+
+    int objIndex1 = floor(float(i) / nodeCount);
+    int objIndex2 = floor(float(j) / triCount);
+
+    if(objIndex1 != objIndex2 && objIndex1 < objIndex2)
+    {   
+        //triangle information     
+        Triangle t2 = triangles[j];
+        
+        Tri t2Vertices;
+        t2Vertices.vertex0 = positions[t2.v0];
+        t2Vertices.vertex1 = positions[t2.v1];
+        t2Vertices.vertex2 = positions[t2.v2];
+
+        float3 norm = caclulateNormal(t2Vertices.vertex0, t2Vertices.vertex1, t2Vertices.vertex2);
+
+        //edge information
+        float3 v1 = positions[i];
+        float3 vel = velocities[i];
+
+        float3 v2 = v1 + (vel * 0.001);
+        
+        collisionResult result = CheckEdgeCollision(v1, v2, t2Vertices);
+        if(result.isCollide){
+            
+            float3 diff = (result.hitPoint - v1);
+
+            InterlockedAdd(directions[i][0], diff.x * 100);
+            InterlockedAdd(directions[i][1], diff.y * 100);
+            InterlockedAdd(directions[i][2], diff.z * 100);
+        }
+    }
+}
+
+#pragma kernel CollisionResponse
+[numthreads(1024, 1, 1)]
+void CollisionResponse (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    float3 dr = float3(0.0, 0.0, 0.0);
+    if(directionCount[i] > 0)
+    {
+        dr = float3(directions[i][0]/100.0,directions[i][1]/100.0,directions[i][2]/100.0);
+        dr = dr / directionCount[i];
+    }
+    
+    ProjectedPositions[i] += (-dr * 0.5) *  convergence_factor;
+    
+    directions[i][0] = int(0);
+    directions[i][1] = int(0);
+    directions[i][2] = int(0);
+    directionCount[i] = int(0);
+}
+
+#pragma kernel CollisionHandling
+[numthreads(32,32,1)]
+void CollisionHandling (uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint j = id.y;
+
+    int objIndex1 = floor(float(i) / triCount);
+    int objIndex2 = floor(float(j) / triCount);
+
+    if(objIndex1 != objIndex2 && objIndex1 <= objIndex2)
+    //if(objIndex1 <= objIndex2)
+    {
+        Triangle t1 = triangles[i];
+        Triangle t2 = triangles[j];
+
+        Tri t1Vertices;
+        t1Vertices.vertex0 = ProjectedPositions[t1.v0];
+        t1Vertices.vertex1 = ProjectedPositions[t1.v1];
+        t1Vertices.vertex2 = ProjectedPositions[t1.v2];
+
+        Tri t2Vertices;
+        t2Vertices.vertex0 = ProjectedPositions[t2.v0];
+        t2Vertices.vertex1 = ProjectedPositions[t2.v1];
+        t2Vertices.vertex2 = ProjectedPositions[t2.v2];
+
+        bool voxelComparision = areTriangleSameVoxel(t1Vertices, t2Vertices);
+
+        if(!voxelComparision) return;
+
+        collisionResult results[6];
+        results[0] = CheckEdgeCollision(t1Vertices.vertex0, t1Vertices.vertex1, t2Vertices);
+        results[1] = CheckEdgeCollision(t1Vertices.vertex0, t1Vertices.vertex2, t2Vertices);
+        results[2] = CheckEdgeCollision(t1Vertices.vertex1, t1Vertices.vertex2, t2Vertices);
+        results[3] = CheckEdgeCollision(t2Vertices.vertex0, t2Vertices.vertex1, t1Vertices);
+        results[4] = CheckEdgeCollision(t2Vertices.vertex0, t2Vertices.vertex2, t1Vertices);
+        results[5] = CheckEdgeCollision(t2Vertices.vertex1, t2Vertices.vertex2, t1Vertices);
+
+        bool c1 = (results[0].isCollide || results[1].isCollide || results[2].isCollide);
+        bool c2 = (results[3].isCollide || results[4].isCollide || results[5].isCollide);        
+        
+        if(c1&&c2)
+        {
+            float3 centerT1 = (t1Vertices.vertex0+t1Vertices.vertex1+t1Vertices.vertex2) / 3.0;
+            float3 centerT2 = (t2Vertices.vertex0+t2Vertices.vertex1+t2Vertices.vertex2) / 3.0;
+
+            float3 normT1 = caclulateNormal(t1Vertices.vertex0, t1Vertices.vertex1, t1Vertices.vertex2);
+            float3 normT2 = caclulateNormal(t2Vertices.vertex0, t2Vertices.vertex1, t2Vertices.vertex2);
+
+            float kCollisionConstraintStiffnessIterInd = 0.5;            
+
+            float3 avgVel1 = (velocities[t1.v0] + velocities[t1.v1] + velocities[t1.v2]) / 3.0;
+            float3 avgVel2 = (velocities[t2.v0] + velocities[t2.v1] + velocities[t2.v2]) / 3.0;
+
+            {
+                float3 relVel = avgVel2 - velocities[t1.v0]; 
+                float3 responseVelocity = normalize(TrianglePointResponse(velocities[t1.v0], normT1, relVel, 1.0, 0.001));
+    
+                InterlockedAdd(directions[t1.v0][0], int(responseVelocity.x * 100));
+                InterlockedAdd(directions[t1.v0][1], int(responseVelocity.y * 100));
+                InterlockedAdd(directions[t1.v0][2], int(responseVelocity.z * 100));
+                InterlockedAdd(directionCount[t1.v0],1);
+            }
+            {
+                float3 relVel = avgVel2 - velocities[t1.v1]; 
+                float3 responseVelocity = normalize(TrianglePointResponse(velocities[t1.v1], normT1, relVel, 1.0, 0.001));
+    
+                InterlockedAdd(directions[t1.v1][0], int(responseVelocity.x * 100));
+                InterlockedAdd(directions[t1.v1][1], int(responseVelocity.y * 100));
+                InterlockedAdd(directions[t1.v1][2], int(responseVelocity.z * 100));
+                InterlockedAdd(directionCount[t1.v1],1);
+            }
+            {
+                float3 relVel = avgVel2 - velocities[t1.v2]; 
+                float3 responseVelocity = normalize(TrianglePointResponse(velocities[t1.v2], normT1, relVel, 1.0, 0.001));
+    
+                InterlockedAdd(directions[t1.v2][0], int(responseVelocity.x * 100));
+                InterlockedAdd(directions[t1.v2][1], int(responseVelocity.y * 100));
+                InterlockedAdd(directions[t1.v2][2], int(responseVelocity.z * 100));
+                InterlockedAdd(directionCount[t1.v2],1);
+            }
+            
+            //T2
+            {
+                float3 relVel = avgVel1 - velocities[t2.v0]; 
+                float3 responseVelocity = normalize(TrianglePointResponse(velocities[t2.v0], normT2, relVel, 1.0, 0.001));
+    
+                InterlockedAdd(directions[t2.v0][0], int(responseVelocity.x * 100));
+                InterlockedAdd(directions[t2.v0][1], int(responseVelocity.y * 100));
+                InterlockedAdd(directions[t2.v0][2], int(responseVelocity.z * 100));
+                InterlockedAdd(directionCount[t2.v0],1);
+            }
+            {
+                float3 relVel = avgVel1 - velocities[t2.v1]; 
+                float3 responseVelocity = normalize(TrianglePointResponse(velocities[t2.v1], normT2, relVel, 1.0, 0.001));
+    
+                InterlockedAdd(directions[t2.v1][0], int(responseVelocity.x * 100));
+                InterlockedAdd(directions[t2.v1][1], int(responseVelocity.y * 100));
+                InterlockedAdd(directions[t2.v1][2], int(responseVelocity.z * 100));
+                InterlockedAdd(directionCount[t2.v1],1);
+            }
+            {
+                float3 relVel = avgVel1 - velocities[t2.v2]; 
+                float3 responseVelocity = normalize(TrianglePointResponse(velocities[t2.v2], normT2, relVel, 1.0, 0.001));
+    
+                InterlockedAdd(directions[t2.v2][0], int(responseVelocity.x * 100));
+                InterlockedAdd(directions[t2.v2][1], int(responseVelocity.y * 100));
+                InterlockedAdd(directions[t2.v2][2], int(responseVelocity.z * 100));
+                InterlockedAdd(directionCount[t2.v2],1);
+            }
+        }
+    }
+}

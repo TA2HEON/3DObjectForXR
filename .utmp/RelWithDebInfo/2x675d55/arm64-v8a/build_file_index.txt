@@ -1,0 +1,2 @@
+E:\Research_2025\3D Deformable Object\3DObjectForXR\Library\Bee\Android\Prj\IL2CPP\Gradle\unityLibrary\src\main\cpp\CMakeLists.txt
+E:\Research_2025\3D Deformable Object\3DObjectForXR\Library\Bee\Android\Prj\IL2CPP\Gradle\unityLibrary\src\main\cpp\GameActivity\CMakeLists.txt
